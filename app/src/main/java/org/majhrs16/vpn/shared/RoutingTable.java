@@ -47,12 +47,13 @@ public class RoutingTable {
 	}
 
 	/**
-	 * Actualiza las entradas que apuntaban a un endpoint antiguo (por ejemplo, la
-	 * IP anterior del relay) para que sigan siendo válidas tras un cambio de IP.
+	 * Actualiza las entradas que apuntaban a la dirección anterior del relay (por
+	 * ejemplo, tras un cambio de IP) para que sigan siendo válidas. Se compara solo
+	 * la dirección porque el puerto de origen puede cambiar por NAT.
 	 */
-	public void remap(InetAddress oldAddress, int oldPort, InetAddress newAddress, int newPort) {
+	public void remap(InetAddress oldAddress, InetAddress newAddress, int newPort) {
 		entries.replaceAll((vip, ep) ->
-				ep.address.equals(oldAddress) && ep.port == oldPort
+				ep.address.equals(oldAddress)
 						? new Endpoint(newAddress, newPort)
 						: ep);
 	}

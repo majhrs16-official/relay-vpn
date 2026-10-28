@@ -479,7 +479,7 @@ public class VPNService extends VpnService {
 			InetSocketAddress updated = new InetSocketAddress(selected, config.serverPortNode);
 			relayAddr = updated;
 			if (currentAddress != null) {
-				routingTable.remap(currentAddress, current.getPort(), selected, config.serverPortNode);
+				routingTable.remap(currentAddress, selected, config.serverPortNode);
 			}
 
 			NodeLog.i(TAG, "IP del relay actualizada: " + currentLabel + " -> "

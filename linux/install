@@ -1,1 +1,5 @@
-sudo apt update && sudo apt install build-essential libssl-dev gcc make
+#!/bin/sh
+set -eu
+
+sudo apt update
+sudo apt install -y build-essential libssl-dev gcc make

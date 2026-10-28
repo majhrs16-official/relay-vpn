@@ -67,7 +67,8 @@ Archivo: `app/src/main/java/org/majhrs16/vpn/service/VPNService.java`
 - Un fallo de DNS no corta el túnel: se mantiene la última dirección válida y
   se registra una advertencia.
 - `RoutingTable.remap()` reemplaza únicamente los endpoints que coinciden con la
-  IP/puerto anteriores del relay; los peers directos de la LAN no se tocan.
+  dirección anterior del relay (se ignora el puerto porque puede cambiar por
+  NAT); los peers directos de otras IP no se tocan.
 
 ### 3.2 Detalle Linux
 
