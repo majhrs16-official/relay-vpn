@@ -545,9 +545,12 @@ int main(int argc, char *argv[]) {
 					inet_ntop(AF_INET, &relay_addr.sin_addr, relay_str, sizeof(relay_str));
 					printf("[INFO] Relay recableado a %s:%d\n", relay_str, ntohs(relay_addr.sin_port));
 
-					/* Fuerza un heartbeat inmediato y evita que el detector de
-					   silencio vuelva a re-evaluar en el mismo ciclo. */
-					last_heartbeat = 0;
+					/* Heartbeat inmediato para que el relay registre el nuevo
+					   endpoint, y reset del detector de silencio. */
+					unsigned char hb[20];
+					build_heartbeat(hb, config.virtual_ip, config.relay_virtual_ip);
+					wrap_send_packet(udp_fd, &relay_addr, hb, sizeof(hb));
+					last_heartbeat = time(NULL);
 					last_udp_recv = tnow;
 					last_eval = tnow;
 				}
