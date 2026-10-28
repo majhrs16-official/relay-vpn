@@ -69,7 +69,8 @@ Ambos clientes re-resuelven el dominio del relay cada **5 segundos**. Si el
 DDNS/ISP cambia la IP pública, el cliente actualiza el endpoint sin reiniciar:
 
 - Android remapea las rutas aprendidas y envía un heartbeat inmediato.
-- Linux vuelve a seleccionar el mejor camino (LAN, LAN publicitada o pública).
+- Linux vuelve a seleccionar el mejor camino (LAN, LAN publicitada o pública)
+  y hace la resolución DNS en un hilo aparte para no bloquear el túnel.
 
 El servidor no necesita reiniciarse en el caso normal. El plan y los criterios
 de validación están en [`docs/PLAN.md`](docs/PLAN.md).

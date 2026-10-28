@@ -12,6 +12,8 @@
 #include <linux/if_tun.h>
 #include <time.h>
 #include <netdb.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #include "crypto.h"
 
@@ -31,21 +33,58 @@ static char global_net_str[32] = {0};
 static int psk_enabled = 0;
 static unsigned char psk_key[KEY_LEN];
 
+/* Estado compartido con el hilo que vigila el DNS. Se usan atómicos para no
+   bloquear el bucle de paquetes ni arriesgar lecturas a medio escribir. */
+static _Atomic uint32_t dns_last_ip = 0;
+static _Atomic uint32_t dns_pending_ip = 0;
+static _Atomic int dns_pending = 0;
+
 void handle_signal(int sig) {
 	(void)sig;
 	is_running = 0;
 }
 
-int resolve_host(const char *hostname, int port, struct sockaddr_in *addr) {
-	struct hostent *he = gethostbyname(hostname);
-	if (he == NULL) {
+/*
+ * Resuelve el hostname y prefiere `preferred` si sigue apareciendo entre los
+ * registros A. Así un DDNS con varias IPs no hace oscilar el endpoint.
+ */
+int resolve_host_preferred(const char *hostname, int port, struct in_addr preferred,
+                           struct sockaddr_in *addr) {
+	struct addrinfo hints;
+	struct addrinfo *result = NULL;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_DGRAM;
+
+	if (getaddrinfo(hostname, NULL, &hints, &result) != 0) {
 		return -1;
 	}
+
+	struct in_addr first = { .s_addr = 0 };
+	struct in_addr chosen = { .s_addr = 0 };
+	for (struct addrinfo *p = result; p != NULL; p = p->ai_next) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)p->ai_addr;
+		if (first.s_addr == 0) first = sin->sin_addr;
+		if (preferred.s_addr != 0 && sin->sin_addr.s_addr == preferred.s_addr) {
+			chosen = sin->sin_addr;
+			break;
+		}
+	}
+	freeaddrinfo(result);
+
+	if (chosen.s_addr == 0) chosen = first;
+	if (chosen.s_addr == 0) return -1;
+
 	memset(addr, 0, sizeof(struct sockaddr_in));
 	addr->sin_family = AF_INET;
 	addr->sin_port = htons(port);
-	memcpy(&addr->sin_addr, he->h_addr_list[0], he->h_length);
+	addr->sin_addr = chosen;
 	return 0;
+}
+
+int resolve_host(const char *hostname, int port, struct sockaddr_in *addr) {
+	struct in_addr none = { .s_addr = 0 };
+	return resolve_host_preferred(hostname, port, none, addr);
 }
 
 #define PONG_TAG "PONG"
@@ -82,6 +121,54 @@ static long long now_ms(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
+ * Hilo independiente del reenvío de paquetes. La resolución DNS puede tardar
+ * segundos (router/DDNS); si se hiciera en el bucle principal, el túnel se
+ * quedaría sin procesar tráfico y las respuestas se acumularían.
+ */
+static void *dns_monitor_loop(void *arg) {
+	const config_t *config = (const config_t *)arg;
+	long long last_error = 0;
+
+	while (is_running) {
+		sleep(DNS_CHECK_INTERVAL_MS / 1000);
+		if (!is_running) break;
+
+		struct in_addr preferred;
+		preferred.s_addr = atomic_load(&dns_last_ip);
+
+		long long resolve_start = now_ms();
+		struct sockaddr_in resolved;
+		int resolve_rc = resolve_host_preferred(config->relay_host, config->relay_port,
+		                                        preferred, &resolved);
+		long long resolve_ms = now_ms() - resolve_start;
+		if (resolve_ms >= 1000) {
+			fprintf(stderr, "[WARN] La resolución DNS de %s tardó %lld ms.\n",
+			        config->relay_host, resolve_ms);
+		}
+		if (resolve_rc == 0) {
+			if (resolved.sin_addr.s_addr != preferred.s_addr) {
+				atomic_store(&dns_pending_ip, resolved.sin_addr.s_addr);
+				atomic_store(&dns_pending, 1);
+				atomic_store(&dns_last_ip, resolved.sin_addr.s_addr);
+
+				char old_ip[INET_ADDRSTRLEN], new_ip[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, &preferred, old_ip, sizeof(old_ip));
+				inet_ntop(AF_INET, &resolved.sin_addr, new_ip, sizeof(new_ip));
+				printf("[INFO] IP pública del relay actualizada: %s -> %s\n", old_ip, new_ip);
+			}
+		} else {
+			long long now = now_ms();
+			if (now - last_error >= DNS_ERROR_LOG_INTERVAL_MS) {
+				last_error = now;
+				fprintf(stderr, "[WARN] No se pudo resolver %s; se mantiene el relay actual.\n",
+				        config->relay_host);
+			}
+		}
+	}
+	return NULL;
 }
 
 void build_heartbeat(unsigned char *hb, const char *src_ip, const char *dst_ip) {
@@ -424,8 +511,8 @@ int main(int argc, char *argv[]) {
 	}
 
 	// Selección de ruta rápida: probar el gateway local (LAN) vs la vía pública
+	struct sockaddr_in public_resolved = relay_addr;
 	struct sockaddr_in relay_used = relay_addr;
-	struct in_addr last_public_ip = relay_addr.sin_addr;
 	struct in_addr gw_ip;
 	if (get_default_gateway(&gw_ip) == 0) {
 		int mode = select_relay_endpoint(&relay_addr, &gw_ip, config.relay_port,
@@ -446,14 +533,22 @@ int main(int argc, char *argv[]) {
 		printf("[INFO] Relay vía %s:%d (gateway no detectado)\n", config.relay_host, config.relay_port);
 	}
 	relay_addr = relay_used;
+	atomic_store(&dns_last_ip, public_resolved.sin_addr.s_addr);
+
+	pthread_t dns_thread;
+	if (pthread_create(&dns_thread, NULL, dns_monitor_loop, &config) == 0) {
+		pthread_detach(dns_thread);
+	} else {
+		fprintf(stderr, "[WARN] No se pudo iniciar el monitor DNS; "
+		        "se usará la re-evaluación por silencio.\n");
+	}
 
 	fd_set readfds;
 	unsigned char raw_buf[BUFFER_SIZE];
 	time_t last_heartbeat = 0;
 	long long last_udp_recv = now_ms();
 	long long last_eval = now_ms();
-	long long last_dns_check = now_ms();
-	long long last_dns_error = 0;
+	long long last_silence_dns_error = 0;
 
 	while (is_running) {
 		time_t now = time(NULL);
@@ -517,48 +612,39 @@ int main(int argc, char *argv[]) {
 			}
 		}
 
-		// Comprobación periódica del dominio: si el ISP/DDNS cambió la IP
-		// pública del relay, re-resolvemos y recableamos sin reiniciar.
 		long long tnow = now_ms();
-		if (tnow - last_dns_check >= DNS_CHECK_INTERVAL_MS) {
-			last_dns_check = tnow;
+
+		// El hilo DNS solo marca el cambio. Aquí, en el hilo de paquetes, se
+		// reclasifica la ruta y se envía el heartbeat para no bloquear el túnel.
+		if (atomic_exchange(&dns_pending, 0)) {
 			struct sockaddr_in resolved_public;
-			if (resolve_host(config.relay_host, config.relay_port, &resolved_public) == 0) {
-				if (resolved_public.sin_addr.s_addr != last_public_ip.s_addr) {
-					char old_ip[INET_ADDRSTRLEN], new_ip[INET_ADDRSTRLEN];
-					inet_ntop(AF_INET, &last_public_ip, old_ip, sizeof(old_ip));
-					inet_ntop(AF_INET, &resolved_public.sin_addr, new_ip, sizeof(new_ip));
-					printf("[INFO] IP pública del relay actualizada: %s -> %s\n", old_ip, new_ip);
-					last_public_ip = resolved_public.sin_addr;
+			memset(&resolved_public, 0, sizeof(resolved_public));
+			resolved_public.sin_family = AF_INET;
+			resolved_public.sin_port = htons(config.relay_port);
+			resolved_public.sin_addr.s_addr = atomic_load(&dns_pending_ip);
 
-					struct in_addr gw;
-					struct sockaddr_in chosen;
-					if (get_default_gateway(&gw) == 0) {
-						int m = select_relay_endpoint(&resolved_public, &gw, config.relay_port,
-						                              config.virtual_ip, config.relay_virtual_ip, &chosen);
-						relay_addr = (m == 1 || m == 4 || m == 2) ? chosen : resolved_public;
-					} else {
-						relay_addr = resolved_public;
-					}
-
-					char relay_str[INET_ADDRSTRLEN];
-					inet_ntop(AF_INET, &relay_addr.sin_addr, relay_str, sizeof(relay_str));
-					printf("[INFO] Relay recableado a %s:%d\n", relay_str, ntohs(relay_addr.sin_port));
-
-					/* Heartbeat inmediato para que el relay registre el nuevo
-					   endpoint, y reset del detector de silencio. */
-					unsigned char hb[20];
-					build_heartbeat(hb, config.virtual_ip, config.relay_virtual_ip);
-					wrap_send_packet(udp_fd, &relay_addr, hb, sizeof(hb));
-					last_heartbeat = time(NULL);
-					last_udp_recv = tnow;
-					last_eval = tnow;
-				}
-			} else if (tnow - last_dns_error >= DNS_ERROR_LOG_INTERVAL_MS) {
-				last_dns_error = tnow;
-				fprintf(stderr, "[WARN] No se pudo resolver %s; se mantiene el relay actual.\n",
-				        config.relay_host);
+			struct in_addr gw;
+			struct sockaddr_in chosen;
+			if (get_default_gateway(&gw) == 0) {
+				int m = select_relay_endpoint(&resolved_public, &gw, config.relay_port,
+				                              config.virtual_ip, config.relay_virtual_ip, &chosen);
+				relay_addr = (m == 1 || m == 4 || m == 2) ? chosen : resolved_public;
+			} else {
+				relay_addr = resolved_public;
 			}
+
+			char relay_str[INET_ADDRSTRLEN];
+			inet_ntop(AF_INET, &relay_addr.sin_addr, relay_str, sizeof(relay_str));
+			printf("[INFO] Relay recableado a %s:%d\n", relay_str, ntohs(relay_addr.sin_port));
+
+			/* Heartbeat inmediato para que el relay registre el nuevo
+			   endpoint, y reset del detector de silencio. */
+			unsigned char hb[20];
+			build_heartbeat(hb, config.virtual_ip, config.relay_virtual_ip);
+			wrap_send_packet(udp_fd, &relay_addr, hb, sizeof(hb));
+			last_heartbeat = time(NULL);
+			last_udp_recv = tnow;
+			last_eval = tnow;
 		}
 
 		// Re-evaluación periódica del relay: si el enlace queda mudo, re-resuelve el
@@ -568,7 +654,7 @@ int main(int argc, char *argv[]) {
 			last_eval = tnow;
 			struct sockaddr_in new_public;
 			if (resolve_host(config.relay_host, config.relay_port, &new_public) == 0) {
-				last_public_ip = new_public.sin_addr;
+				atomic_store(&dns_last_ip, new_public.sin_addr.s_addr);
 				struct in_addr gw;
 				struct sockaddr_in chosen;
 				if (get_default_gateway(&gw) == 0) {
@@ -583,8 +669,8 @@ int main(int argc, char *argv[]) {
 						relay_addr = chosen;
 					}
 				}
-			} else if (tnow - last_dns_error >= DNS_ERROR_LOG_INTERVAL_MS) {
-				last_dns_error = tnow;
+			} else if (tnow - last_silence_dns_error >= DNS_ERROR_LOG_INTERVAL_MS) {
+				last_silence_dns_error = tnow;
 				fprintf(stderr, "[WARN] No se pudo resolver %s; se mantiene el relay actual.\n",
 				        config.relay_host);
 			}

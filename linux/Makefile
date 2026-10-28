@@ -1,6 +1,6 @@
 CC ?= gcc
-CFLAGS ?= -Wall -Wextra -O2
-LIBS ?= -lcrypto
+CFLAGS ?= -Wall -Wextra -O2 -std=gnu11 -pthread
+LIBS ?= -lcrypto -pthread
 TARGET = bin/vpn
 SRCS = src/main.c src/crypto.c
 HDRS = src/crypto.h

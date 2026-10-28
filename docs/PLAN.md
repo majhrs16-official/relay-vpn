@@ -74,16 +74,27 @@ Archivo: `app/src/main/java/org/majhrs16/vpn/service/VPNService.java`
 
 Archivo: `linux/src/main.c`
 
-- Se guarda la última IP pública resuelta (`last_public_ip`) separada del
-  endpoint efectivo (`relay_addr`), que puede ser el gateway de la LAN o una IP
-  LAN publicitada por el relay.
-- Cada `DNS_CHECK_INTERVAL_MS` (5 s) se resuelve el dominio. Solo si la IP
-  pública cambió se vuelve a ejecutar `select_relay_endpoint()` y se actualiza
-  `relay_addr`.
+- Se guarda la última IP pública resuelta (`dns_last_ip`) separada del endpoint
+  efectivo (`relay_addr`), que puede ser el gateway de la LAN o una IP LAN
+  publicitada por el relay.
+- La resolución DNS corre en un **hilo aparte** (`dns_monitor_loop`). El hilo
+  solo publica el cambio mediante variables atómicas; el bucle de paquetes es
+  quien reclasifica la ruta y envía el heartbeat.
+- Esto evita el fallo observado con routers en hairpin: si `getaddrinfo()` tarda
+  segundos (DNS del router/DDNS), antes bloqueaba el bucle principal cada 5 s y
+  las respuestas se acumulaban, produciendo latencias crecientes y pérdida de
+  paquetes.
+- Se usa `getaddrinfo()` en lugar de `gethostbyname()` (es thread-safe) y se
+  prefiere la IP actual si sigue apareciendo entre los registros A. Así un DDNS
+  con varias direcciones no hace oscilar el endpoint.
+- Cada `DNS_CHECK_INTERVAL_MS` (5 s) el hilo resuelve el dominio. Solo si la IP
+  pública cambió se marca un cambio; el bucle principal vuelve a ejecutar
+  `select_relay_endpoint()` y actualiza `relay_addr`.
 - Se fuerza un heartbeat inmediato y se reinician los temporizadores de
   silencio para no duplicar la re-evaluación.
 - Los errores de DNS se registran como máximo cada 30 s para no llenar la
-  salida cuando el enlace está caído.
+  salida cuando el enlace está caído. Si una resolución tarda 1 s o más, se
+  registra una advertencia con la duración para facilitar el diagnóstico.
 - La lógica reactiva anterior (silencio de 12–15 s) se conserva como respaldo.
 
 ## 4. Cambio de compatibilidad importante
