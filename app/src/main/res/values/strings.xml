@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+	<string name="app_name">Relay VPN</string>
+	<string name="notification_title">Túnel VPN</string>
+	<string name="notification_channel_name">Túnel VPN</string>
+	<string name="config_title">VPN Tunnel (Relay / Nodo)</string>
+</resources>

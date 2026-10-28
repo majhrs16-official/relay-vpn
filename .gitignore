@@ -1,0 +1,29 @@
+# Android / Gradle
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+dist/
+*.apk
+*.aab
+
+# Firma (nunca subir claves privadas)
+*.keystore
+*.jks
+keystore.properties
+
+# Binarios y objetos nativos
+linux/bin/
+*.o
+*.obj
+
+# SO / editores
+.DS_Store
+Thumbs.db
+*~
+*.swp

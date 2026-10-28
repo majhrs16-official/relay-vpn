@@ -1,0 +1,30 @@
+plugins {
+	id 'com.android.application'
+}
+
+android {
+	namespace 'org.majhrs16.vpn'
+	compileSdk 34
+
+	defaultConfig {
+		applicationId 'org.majhrs16.vpn'
+		minSdk 26
+		targetSdk 34
+		versionCode 1
+		versionName "1.0"
+
+		multiDexEnabled true
+	}
+
+	compileOptions {
+		sourceCompatibility JavaVersion.VERSION_17
+		targetCompatibility JavaVersion.VERSION_17
+	}
+}
+
+dependencies {
+	implementation 'androidx.appcompat:appcompat:1.6.1'
+	// Versiones alineadas del runtime de Kotlin usado por AppCompat/Activity.
+	implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.24'
+	implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+}
