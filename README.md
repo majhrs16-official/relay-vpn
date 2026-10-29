@@ -43,12 +43,32 @@ también en `dist/vpn-debug.apk`.
 
 ## Compilar el cliente Linux
 
-Requisitos: `gcc`, `make` y las cabeceras de OpenSSL (`libssl-dev`).
+Requisitos para x86_64: `gcc`, `make` y las cabeceras de OpenSSL (`libssl-dev`).
+Para i686 (x86) además se necesita el soporte multilib:
+`gcc-multilib`, `libc6-dev-i386` y `libssl-dev:i386`.
 
 ```sh
 cd linux
+
+# x86_64 -> bin/vpn
 make
+
+# i686 (32 bits) -> bin/vpn-x86
+make x86
+```
+
+Si faltan dependencias:
+
+```sh
+make deps       # x86_64
+make deps-x86   # añade i386 y las dependencias de 32 bits
+```
+
+Uso:
+
+```sh
 sudo ./bin/vpn -l relay.dominio.com:4242 -i 10.42.0.2 -r 10.42.0.1 -k 'PSK'
+sudo ./bin/vpn-x86 -l relay.dominio.com:4242 -i 10.42.0.2 -r 10.42.0.1 -k 'PSK'
 ```
 
 Opciones:

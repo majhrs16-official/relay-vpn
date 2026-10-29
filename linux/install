@@ -1,5 +1,18 @@
 #!/bin/sh
 set -eu
 
-sudo apt update
-sudo apt install -y build-essential libssl-dev gcc make
+MODE="${1:-native}"
+
+if [ "$MODE" = "x86" ]; then
+	# Debian/Ubuntu necesitan la arquitectura i386 habilitada para compilar
+	# y enlazar contra las bibliotecas de 32 bits.
+	if ! dpkg --print-foreign-architectures | grep -qx i386; then
+		sudo dpkg --add-architecture i386
+	fi
+	sudo apt update
+	sudo apt install -y build-essential gcc make libssl-dev \
+		gcc-multilib libc6-dev-i386 libssl-dev:i386
+else
+	sudo apt update
+	sudo apt install -y build-essential libssl-dev gcc make
+fi

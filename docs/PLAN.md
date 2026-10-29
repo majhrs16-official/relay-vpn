@@ -2,7 +2,7 @@
 
 ## 1. Estado del repositorio
 
-El proyecto se unificó en un monorepo con dos ejecutables y sus archivos separados:
+El proyecto se unificó en un monorepo con tres ejecutables y sus archivos separados:
 
 ```text
 .
@@ -10,6 +10,8 @@ El proyecto se unificó en un monorepo con dos ejecutables y sus archivos separa
 ├── linux/                # Nodo cliente para Linux (C + OpenSSL)
 │   ├── Makefile
 │   ├── install
+│   ├── bin/vpn           # x86_64
+│   ├── bin/vpn-x86       # i686
 │   └── src/
 ├── docs/PLAN.md
 ├── gradle/ gradlew*      # Wrapper de Android
@@ -18,7 +20,8 @@ El proyecto se unificó en un monorepo con dos ejecutables y sus archivos separa
 ```
 
 - Android se construye desde la raíz con Gradle.
-- El cliente Linux se construye desde `linux/` con `make`.
+- El cliente Linux x86_64 se construye desde `linux/` con `make`.
+- El cliente Linux i686 se construye desde `linux/` con `make x86`.
 - El repositorio remoto `majhrs16-official/relay-vpn` ya contiene `LICENSE`
   (GPL-3.0). No se elimina ni se reemplaza: se conserva al sincronizar `main`.
 
@@ -46,9 +49,12 @@ lado cliente:
 
 - **Android (modo cliente):** un hilo re-resuelve el dominio del relay cada
   5 segundos y actualiza el endpoint si la IP cambió.
-- **Linux (siempre cliente):** el bucle principal re-resuelve el dominio cada
-  5 segundos y, si cambió la IP pública, vuelve a seleccionar el mejor endpoint
-  (LAN, LAN publicitada o pública) y recablea el relay.
+- **Linux (siempre cliente):** un hilo aparte re-resuelve el dominio cada
+  5 segundos y, si cambió la IP pública, el bucle principal vuelve a seleccionar
+  el mejor endpoint (LAN, LAN publicitada o pública) y recablea el relay.
+- **Compilaciones Linux:** `make` genera `bin/vpn` (x86_64) y `make x86`
+  genera `bin/vpn-x86` (i686). Requiere `gcc-multilib`, `libc6-dev-i386` y
+  `libssl-dev:i386`; `make deps-x86` los instala en Debian/Ubuntu.
 - **Servidor Android (modo relay):** sin cambios. Su tabla de rutas ya se
   refresca con los heartbeats de los clientes, por lo que un cliente que vuelve
   a conectarse desde una IP/NAT nuevos se registra solo.
