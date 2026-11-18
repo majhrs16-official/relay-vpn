@@ -14,10 +14,13 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <poll.h>
 
 #include "crypto.h"
 
 #define BUFFER_SIZE 4096
+/* MTU del túnel: deja margen para el sobre UDP+GCM (1428 B) sin fragmentar el enlace. */
+#define TUN_MTU 1400
 
 typedef struct {
 	char relay_host[128];
@@ -362,6 +365,11 @@ int configure_tun_ip(const char *dev_name, const char *ip_str) {
 		return -1;
 	}
 
+	ifr.ifr_mtu = TUN_MTU;
+	if (ioctl(sock, SIOCSIFMTU, &ifr) < 0) {
+		perror("[WARN] No se pudo ajustar el MTU del túnel");
+	}
+
 	if (ioctl(sock, SIOCGIFFLAGS, &ifr) >= 0) {
 		ifr.ifr_flags |= IFF_UP;
 		if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
@@ -430,6 +438,94 @@ int tun_alloc(char *dev) {
 void print_usage(const char *prog_name) {
 	printf("Uso: sudo %s -l <relay_ip:port> -i <virtual_ip> [-r <relay_virtual_ip>] [-k <psk>]\n", prog_name);
 	printf("     -k <psk>: cifra el tráfico con AES-256-GCM derivado del PSK (mismo en todos los nodos)\n");
+}
+
+
+/* -------------------------------------------------------------------------
+ * Hilos de paquetes.
+ *
+ * El bucle único con select() procesaba un paquete por iteración: con TCP en
+ * ambos sentidos cada paquete cuesta ~100 us de ida y vuelta, y el túnel se
+ * quedaba en ~9.400 paq/s (~100 Mbps) aunque el enlace admite 228 Mbps y el
+ * equipo tenga dos núcleos. Separar subida y bajada en dos hilos solapa ese
+ * coste y no cambia ni un byte del protocolo.
+ * ------------------------------------------------------------------------- */
+
+static int g_tun_fd = -1;
+static int g_udp_fd = -1;
+static struct sockaddr_in g_relay;
+static pthread_mutex_t g_relay_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic long long g_last_udp_recv = 0;
+
+static void relay_get(struct sockaddr_in *out) {
+	pthread_mutex_lock(&g_relay_lock);
+	*out = g_relay;
+	pthread_mutex_unlock(&g_relay_lock);
+}
+
+static void relay_set(const struct sockaddr_in *in) {
+	pthread_mutex_lock(&g_relay_lock);
+	g_relay = *in;
+	pthread_mutex_unlock(&g_relay_lock);
+}
+
+/* TUN -> relay (subida). */
+static void *up_loop(void *arg) {
+	(void) arg;
+	unsigned char buf[BUFFER_SIZE];
+	while (is_running) {
+		struct pollfd pfd = { .fd = g_tun_fd, .events = POLLIN, .revents = 0 };
+		int r = poll(&pfd, 1, 500);
+		if (r < 0) {
+			if (errno == EINTR) continue;
+			break;
+		}
+		if (r == 0) continue;
+		ssize_t n = read(g_tun_fd, buf, sizeof(buf));
+		if (n <= 0) continue;
+		struct sockaddr_in to;
+		relay_get(&to);
+		wrap_send_packet(g_udp_fd, &to, buf, (size_t) n);
+	}
+	return NULL;
+}
+
+/* relay -> TUN (bajada). */
+static void *down_loop(void *arg) {
+	(void) arg;
+	unsigned char buf[BUFFER_SIZE];
+	unsigned char out[BUFFER_SIZE];
+	long long last_warn = 0;
+	unsigned long bad = 0;
+	while (is_running) {
+		struct sockaddr_in from;
+		socklen_t flen = sizeof(from);
+		ssize_t n = recvfrom(g_udp_fd, buf, sizeof(buf), 0,
+				(struct sockaddr *) &from, &flen);
+		if (n < 0) {
+			if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+			break;
+		}
+		atomic_store(&g_last_udp_recv, now_ms());
+		if (n >= PONG_TAG_LEN + 4 && memcmp(buf, PONG_TAG, PONG_TAG_LEN) == 0) continue;
+		int plen = unwrap_packet(buf, (size_t) n, out, sizeof(out));
+		if (plen < 0) {
+			/* Un paquete suelto no importa; una ráfaga sí, y se avisa 1/s. */
+			bad++;
+			long long t = now_ms();
+			if (t - last_warn >= 1000) {
+				char src_str[INET_ADDRSTRLEN];
+				inet_ntop(AF_INET, &from.sin_addr, src_str, sizeof(src_str));
+				fprintf(stderr, "[WARN] %lu paquetes no auténticos; último de %s:%d (%zu bytes)\n",
+						bad, src_str, ntohs(from.sin_port), n);
+				last_warn = t;
+				bad = 0;
+			}
+			continue;
+		}
+		write(g_tun_fd, out, (size_t) plen);
+	}
+	return NULL;
 }
 
 int main(int argc, char *argv[]) {
@@ -501,6 +597,12 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
+	/* El tráfico de todos los peers comparte este socket: sin buffer grande,
+	   un stall de scheduling tira paquetes y TCP colapsa. */
+	int sock_buf = 4 * 1024 * 1024;
+	setsockopt(udp_fd, SOL_SOCKET, SO_RCVBUF, &sock_buf, sizeof(sock_buf));
+	setsockopt(udp_fd, SOL_SOCKET, SO_SNDBUF, &sock_buf, sizeof(sock_buf));
+
 	struct sockaddr_in relay_addr;
 	if (resolve_host(config.relay_host, config.relay_port, &relay_addr) < 0) {
 		fprintf(stderr, "[ERROR] No se pudo resolver el hostname: %s\n", config.relay_host);
@@ -543,79 +645,46 @@ int main(int argc, char *argv[]) {
 		        "se usará la re-evaluación por silencio.\n");
 	}
 
-	fd_set readfds;
-	unsigned char raw_buf[BUFFER_SIZE];
+	/* Hilos de paquetes + hilo de control. */
+	g_tun_fd = tun_fd;
+	g_udp_fd = udp_fd;
+	relay_set(&relay_addr);
+	struct timeval rcv_to = { .tv_sec = 0, .tv_usec = 500000 };
+	setsockopt(udp_fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_to, sizeof(rcv_to));
+	atomic_store(&g_last_udp_recv, now_ms());
+
+	pthread_t up_thread = 0, down_thread = 0;
+	if (pthread_create(&up_thread, NULL, up_loop, NULL) != 0) {
+		fprintf(stderr, "[ERROR] No se pudo crear el hilo de subida\n");
+		is_running = 0;
+	}
+	if (pthread_create(&down_thread, NULL, down_loop, NULL) != 0) {
+		fprintf(stderr, "[ERROR] No se pudo crear el hilo de bajada\n");
+		is_running = 0;
+	}
+	printf("[INFO] Túnel en dos hilos (subida/bajada) + control.\n");
+
 	time_t last_heartbeat = 0;
-	long long last_udp_recv = now_ms();
 	long long last_eval = now_ms();
 	long long last_silence_dns_error = 0;
 
 	while (is_running) {
+		sleep(1);
 		time_t now = time(NULL);
+		long long tnow = now_ms();
 
-		// Envía un paquete IP dummy inicial/periódico cada 3 segundos para registrar el puerto en la APK
+		/* Latido periódico: mantiene registrado el puerto en la APK aunque no
+		   haya tráfico que enviar. */
 		if (now - last_heartbeat >= 3) {
-			// Cabecera IPv4 mínima: origen = IP virtual del cliente, destino = IP virtual del relay
-			unsigned char dummy[20] = {0};
-			dummy[0] = 0x45; // Version 4, IHL 5
-			// IP origen (bytes 12-15)
-			struct in_addr src_addr;
-			inet_pton(AF_INET, config.virtual_ip, &src_addr);
-			memcpy(&dummy[12], &src_addr.s_addr, 4);
-			// IP destino (bytes 16-19) = IP virtual del relay
-			struct in_addr dst_addr;
-			inet_pton(AF_INET, config.relay_virtual_ip, &dst_addr);
-			memcpy(&dummy[16], &dst_addr.s_addr, 4);
-
-			wrap_send_packet(udp_fd, &relay_addr, dummy, sizeof(dummy));
+			unsigned char hb[20];
+			build_heartbeat(hb, config.virtual_ip, config.relay_virtual_ip);
+			struct sockaddr_in to;
+			relay_get(&to);
+			wrap_send_packet(udp_fd, &to, hb, sizeof(hb));
 			last_heartbeat = now;
 		}
 
-		FD_ZERO(&readfds);
-		FD_SET(tun_fd, &readfds);
-		FD_SET(udp_fd, &readfds);
-
-		int max_fd = (tun_fd > udp_fd) ? tun_fd : udp_fd;
-		struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
-
-		if (select(max_fd + 1, &readfds, NULL, NULL, &timeout) < 0) {
-			if (errno == EINTR) continue;
-			break;
-		}
-
-		// Tráfico de TUN hacia el Relay UDP
-		if (FD_ISSET(tun_fd, &readfds)) {
-			ssize_t nread = read(tun_fd, raw_buf, sizeof(raw_buf));
-			if (nread > 0) {
-				wrap_send_packet(udp_fd, &relay_addr, raw_buf, nread);
-			}
-		}
-
-		// Tráfico del Relay UDP hacia TUN
-		if (FD_ISSET(udp_fd, &readfds)) {
-			struct sockaddr_in from_addr;
-			socklen_t from_len = sizeof(from_addr);
-			ssize_t nread = recvfrom(udp_fd, raw_buf, sizeof(raw_buf), 0, (struct sockaddr *)&from_addr, &from_len);
-			if (nread > 0) {
-				last_udp_recv = now_ms();
-				if (nread >= PONG_TAG_LEN + 4 && memcmp(raw_buf, PONG_TAG, PONG_TAG_LEN) == 0) continue;
-				unsigned char unpacked[BUFFER_SIZE];
-				int plen = unwrap_packet(raw_buf, nread, unpacked, sizeof(unpacked));
-				if (plen < 0) {
-					char src_str[INET_ADDRSTRLEN];
-					inet_ntop(AF_INET, &from_addr.sin_addr, src_str, sizeof(src_str));
-					fprintf(stderr, "[WARN] Paquete no auténtico/inválido descartado de %s:%d (%zu bytes)\n",
-					        src_str, ntohs(from_addr.sin_port), nread);
-					continue;
-				}
-				write(tun_fd, unpacked, plen);
-			}
-		}
-
-		long long tnow = now_ms();
-
-		// El hilo DNS solo marca el cambio. Aquí, en el hilo de paquetes, se
-		// reclasifica la ruta y se envía el heartbeat para no bloquear el túnel.
+		/* El hilo DNS solo marca el cambio; aquí se reclasifica la ruta. */
 		if (atomic_exchange(&dns_pending, 0)) {
 			struct sockaddr_in resolved_public;
 			memset(&resolved_public, 0, sizeof(resolved_public));
@@ -623,34 +692,33 @@ int main(int argc, char *argv[]) {
 			resolved_public.sin_port = htons(config.relay_port);
 			resolved_public.sin_addr.s_addr = atomic_load(&dns_pending_ip);
 
+			struct sockaddr_in rewire;
 			struct in_addr gw;
-			struct sockaddr_in chosen;
 			if (get_default_gateway(&gw) == 0) {
+				struct sockaddr_in chosen;
 				int m = select_relay_endpoint(&resolved_public, &gw, config.relay_port,
 				                              config.virtual_ip, config.relay_virtual_ip, &chosen);
-				relay_addr = (m == 1 || m == 4 || m == 2) ? chosen : resolved_public;
+				rewire = (m == 1 || m == 4 || m == 2) ? chosen : resolved_public;
 			} else {
-				relay_addr = resolved_public;
+				rewire = resolved_public;
 			}
+			relay_set(&rewire);
 
 			char relay_str[INET_ADDRSTRLEN];
-			inet_ntop(AF_INET, &relay_addr.sin_addr, relay_str, sizeof(relay_str));
-			printf("[INFO] Relay recableado a %s:%d\n", relay_str, ntohs(relay_addr.sin_port));
+			inet_ntop(AF_INET, &rewire.sin_addr, relay_str, sizeof(relay_str));
+			printf("[INFO] Relay recableado a %s:%d\n", relay_str, ntohs(rewire.sin_port));
 
-			/* Heartbeat inmediato para que el relay registre el nuevo
-			   endpoint, y reset del detector de silencio. */
 			unsigned char hb[20];
 			build_heartbeat(hb, config.virtual_ip, config.relay_virtual_ip);
-			wrap_send_packet(udp_fd, &relay_addr, hb, sizeof(hb));
+			wrap_send_packet(udp_fd, &rewire, hb, sizeof(hb));
 			last_heartbeat = time(NULL);
-			last_udp_recv = tnow;
+			atomic_store(&g_last_udp_recv, tnow);
 			last_eval = tnow;
 		}
 
-		// Re-evaluación periódica del relay: si el enlace queda mudo, re-resuelve el
-		// DOMINIO (tolerante a renumeración del ISP) y re-probea gateway / LAN
-		// publicitada / pública para recablearse solo (nunca se hardcodea IP local).
-		if (tnow - last_udp_recv >= 12000 && tnow - last_eval >= 15000) {
+		/* Re-evaluación periódica si el enlace queda mudo: re-resuelve el
+		   dominio y re-probea gateway / LAN publicitada / pública. */
+		if (tnow - atomic_load(&g_last_udp_recv) >= 12000 && tnow - last_eval >= 15000) {
 			last_eval = tnow;
 			struct sockaddr_in new_public;
 			if (resolve_host(config.relay_host, config.relay_port, &new_public) == 0) {
@@ -660,13 +728,17 @@ int main(int argc, char *argv[]) {
 				if (get_default_gateway(&gw) == 0) {
 					int m = select_relay_endpoint(&new_public, &gw, config.relay_port,
 					                              config.virtual_ip, config.relay_virtual_ip, &chosen);
-					if ((m == 1 || m == 4 || m == 2) && !same_endpoint(&chosen, &relay_addr)) {
-						char old_s[INET_ADDRSTRLEN], new_s[INET_ADDRSTRLEN];
-						inet_ntop(AF_INET, &relay_addr.sin_addr, old_s, sizeof(old_s));
-						inet_ntop(AF_INET, &chosen.sin_addr, new_s, sizeof(new_s));
-						printf("[INFO] Relay recableado: %s:%d -> %s:%d\n",
-						       old_s, ntohs(relay_addr.sin_port), new_s, ntohs(chosen.sin_port));
-						relay_addr = chosen;
+					if (m == 1 || m == 4 || m == 2) {
+						struct sockaddr_in current;
+						relay_get(&current);
+						if (!same_endpoint(&chosen, &current)) {
+							char old_s[INET_ADDRSTRLEN], new_s[INET_ADDRSTRLEN];
+							inet_ntop(AF_INET, &current.sin_addr, old_s, sizeof(old_s));
+							inet_ntop(AF_INET, &chosen.sin_addr, new_s, sizeof(new_s));
+							printf("[INFO] Relay recableado: %s:%d -> %s:%d\n",
+							       old_s, ntohs(current.sin_port), new_s, ntohs(chosen.sin_port));
+							relay_set(&chosen);
+						}
 					}
 				}
 			} else if (tnow - last_silence_dns_error >= DNS_ERROR_LOG_INTERVAL_MS) {
@@ -674,10 +746,12 @@ int main(int argc, char *argv[]) {
 				fprintf(stderr, "[WARN] No se pudo resolver %s; se mantiene el relay actual.\n",
 				        config.relay_host);
 			}
-			last_udp_recv = now_ms();
+			atomic_store(&g_last_udp_recv, now_ms());
 		}
 	}
 
+	if (up_thread) pthread_join(up_thread, NULL);
+	if (down_thread) pthread_join(down_thread, NULL);
 	cleanup_tun_network();
 	close(udp_fd);
 	close(tun_fd);

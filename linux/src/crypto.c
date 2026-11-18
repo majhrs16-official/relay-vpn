@@ -5,6 +5,22 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
+/*
+ * Contextos reutilizados, uno por hilo y sentido.
+ *
+ * El cliente reparte el trabajo en tres hilos (subida, bajada y control), así
+ * que un contexto global compartido sería una carrera: EVP_CIPHER_CTX guarda
+ * estado entre llamadas. Con __thread cada hilo tiene el suyo y no hace falta
+ * ningún cerrojo en el camino caliente.
+ */
+static __thread EVP_CIPHER_CTX *gcm_enc_ctx = NULL;
+static __thread EVP_CIPHER_CTX *gcm_dec_ctx = NULL;
+
+static EVP_CIPHER_CTX *get_ctx(EVP_CIPHER_CTX **slot) {
+	if (*slot == NULL) *slot = EVP_CIPHER_CTX_new();
+	return *slot;
+}
+
 int psk_derive(const char *pass, unsigned char key[KEY_LEN]) {
 	const char *salt = PSK_SALT;
 	return PKCS5_PBKDF2_HMAC(pass, (int)strlen(pass),
@@ -16,7 +32,7 @@ int aes_gcm_encrypt(const unsigned char *plain, size_t plen,
                     const unsigned char *key, unsigned char *out) {
 	int ok = 0;
 	unsigned char tag[TAG_LEN];
-	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+	EVP_CIPHER_CTX *ctx = get_ctx(&gcm_enc_ctx);
 	if (!ctx) return -1;
 
 	if (RAND_bytes(out, NONCE_LEN) != 1 ||                         // out[0..NONCE_LEN) = nonce
@@ -38,7 +54,6 @@ int aes_gcm_encrypt(const unsigned char *plain, size_t plen,
 	ok = (int)(total + TAG_LEN);
 
 done:
-	EVP_CIPHER_CTX_free(ctx);
 	return ok ? ok : -1;
 }
 
@@ -47,7 +62,7 @@ int aes_gcm_decrypt(const unsigned char *in, size_t inlen,
 	if (inlen < NONCE_LEN + TAG_LEN) return -1;
 
 	int ok = 0;
-	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+	EVP_CIPHER_CTX *ctx = get_ctx(&gcm_dec_ctx);
 	if (!ctx) return -1;
 
 	if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
@@ -67,6 +82,5 @@ int aes_gcm_decrypt(const unsigned char *in, size_t inlen,
 	ok = (int)((size_t)len + (size_t)fin);
 
 done:
-	EVP_CIPHER_CTX_free(ctx);
 	return ok ? ok : -1;
 }
