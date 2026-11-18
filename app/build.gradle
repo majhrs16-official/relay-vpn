@@ -2,9 +2,52 @@ plugins {
 	id 'com.android.application'
 }
 
+/*
+ * Registro de depuración: se inyecta como constante de compilación.
+ *
+ *   ./gradlew assembleRelease -PvpnDebugLogs=true
+ *
+ * La tarea genera LogConfig.DEBUG, un static final que javac inlinea: con
+ * false, los bloques "if (LogConfig.DEBUG) { ... }" quedan como código muerto
+ * y ni siquiera se emiten en el bytecode, así que no cuesta nada en ejecución.
+ */
+def debugLogs = (project.findProperty('vpnDebugLogs') ?: 'false').toString().toBoolean()
+def logConfigDir = layout.buildDirectory.dir('generated/source/logconfig')
+
+def generateLogConfig = tasks.register('generateLogConfig') {
+	def outputDir = logConfigDir
+	inputs.property('debugLogs', debugLogs)
+	outputs.dir(outputDir)
+	doLast {
+		def target = outputDir.get().file('org/majhrs16/vpn/shared/LogConfig.java').asFile
+		target.parentFile.mkdirs()
+		target.text = """package org.majhrs16.vpn.shared;
+
+/**
+ * Generado por la tarea generateLogConfig: no editar a mano.
+ *
+ * DEBUG es una constante de compilación. Con false, javac elimina los bloques
+ * "if (LogConfig.DEBUG) { ... }" del bytecode y el registro no cuesta nada.
+ */
+public final class LogConfig {
+\tpublic static final boolean DEBUG = ${debugLogs};
+
+\tprivate LogConfig() {
+\t}
+}
+"""
+	}
+}
+
 android {
 	namespace 'org.majhrs16.vpn'
 	compileSdk 34
+
+	sourceSets {
+		main {
+			java.srcDir logConfigDir
+		}
+	}
 
 	defaultConfig {
 		applicationId 'org.majhrs16.vpn'
@@ -20,6 +63,17 @@ android {
 		sourceCompatibility JavaVersion.VERSION_17
 		targetCompatibility JavaVersion.VERSION_17
 	}
+
+	buildTypes {
+		release {
+			// Firma con la clave de debug para poder actualizar sobre el APK instalado.
+			// Importante: solo los APK no debuggable reciben compilación AOT de ART;
+			// las apps debuggable se ejecutan en el intérprete y ahogan el túnel.
+			signingConfig signingConfigs.debug
+			minifyEnabled false
+		}
+	}
+
 }
 
 dependencies {
@@ -27,4 +81,8 @@ dependencies {
 	// Versiones alineadas del runtime de Kotlin usado por AppCompat/Activity.
 	implementation 'org.jetbrains.kotlin:kotlin-stdlib:1.9.24'
 	implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+}
+
+tasks.withType(JavaCompile).configureEach {
+	dependsOn generateLogConfig
 }

@@ -19,6 +19,8 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 
+import java.io.File;
+
 public class MainActivity extends AppCompatActivity {
 
 	private static final String TAG = "MainActivity";
@@ -43,6 +45,9 @@ public class MainActivity extends AppCompatActivity {
 	protected void onCreate(Bundle savedInstanceState) {
 		super.onCreate(savedInstanceState);
 		setContentView(R.layout.activity_main);
+
+		File[] mediaDirs = getExternalMediaDirs();
+		NodeLog.initFile(mediaDirs != null && mediaDirs.length > 0 ? mediaDirs[0] : null);
 
 		editPsk = findViewById(R.id.editPsk);
 		editServerPort = findViewById(R.id.editLhPort);
